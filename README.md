@@ -14,6 +14,10 @@ Grab the installer for your platform from the [latest release](../../releases/la
 | Windows (x64) | `dt-framework-<version>-win-x64.exe` |
 | Linux (x64) | `dt-framework-<version>-linux-x64.AppImage` / `.deb` |
 
+## Documentation
+
+Full framework documentation: [framework-documentation.md](./framework-documentation.md).
+
 ## Auto-update
 
 `electron-updater` polls `latest-mac.yml` / `latest.yml` / `latest-linux.yml` attached to each release and prompts the user when a newer version is available.
