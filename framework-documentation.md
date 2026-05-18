@@ -1,6 +1,6 @@
 # DT Framework Documentation
 
-> **Version:** 2.6.1
+> **Version:** 2.9.6
 > **Audience:** researchers, developers, and integrators building Digital Twin scenarios
 > **Status:** working draft
 
@@ -342,17 +342,19 @@ Use cases:
 
 ### 6.5 Device Slots
 
-Device Slots formalize the relationship between Instances and Devices. An Instance Type declares one or more named slots, each constrained to a `device_category` and marked as required or optional. When you create an Instance and attach Devices to it, the framework validates the slots are filled.
+Device Slots formalize the relationship between Instances and Devices. An Instance Type declares one or more named slots, each constrained to a `device_type_id` (the device-catalog entry) and marked as required or optional. When you create an Instance and attach Devices to it, the framework validates the slots are filled.
 
-Example: a "tracked asset" template might declare:
+Example: a "tracked asset" template might declare three slots, each pointing at a Device Type from the catalog:
 
 ```json
 [
-  { "slot_name": "gps", "device_category": "gps_sensor", "required": true },
-  { "slot_name": "tag", "device_category": "rfid_tag", "required": true },
-  { "slot_name": "camera", "device_category": "camera", "required": false }
+  { "slot_name": "gps",    "device_type_id": "<uuid of gps_sensor>", "required": true },
+  { "slot_name": "tag",    "device_type_id": "<uuid of rfid_tag>",   "required": true },
+  { "slot_name": "camera", "device_type_id": "<uuid of camera>",     "required": false }
 ]
 ```
+
+In the UI you do not see the UUID — the slot editor shows the Device Type name from the catalog (`gps_sensor`, `rfid_tag`, `camera`) and stores the corresponding UUID under the hood.
 
 Every Instance of this type expects to have a GPS device and an RFID tag bound to it; a camera is optional. The framework rejects Instance creation if a required slot is unbound.
 
@@ -678,70 +680,183 @@ If a DT Type with the same name already exists, the preview surfaces the conflic
 
 Every algorithm receives a `context` dict. The exact contents depend on the algorithm type. Below is the complete authoritative list — do not assume helpers exist beyond what is listed here.
 
-### 13.1 Helpers Available in Both Generation and Processing Algorithms
+### 13.1 The Device-Instance Link
 
-These come from the device-helpers module and are injected into every algorithm context.
+A **device is a data source** (sensor, simulator, controller). An **instance is a digital twin object** (a forklift, a container, a building). They are linked through `dt_instance_devices`, a junction table.
 
-#### Device-state helpers
+**Cardinality rule:**
+- One device belongs to at most **one instance** (its "owner"). The reverse lookup always returns 0 or 1 result.
+- One instance can own **many devices** (e.g. GPS + battery + RFID + weight sensor).
 
-| Function | Purpose |
-| --- | --- |
-| `context["get_device"](device_id)` | Returns the full Device dict (`device_name`, `device_identifier`, `device_type`, `description`, `status`, `device_context`, `parent_id`). Returns `None` if not found. |
-| `context["update_position"](device_id, x, y, z=0.0)` | Updates the device's spatial position (in meters). Returns `True` on success. |
-| `context["update_floorplan_position"](device_id, x, y)` | Updates the device's normalized position on its parent floorplan (values 0.0 to 1.0). Useful for drill-down floorplans. |
-| `context["set_color"](device_id, color)` | Sets the device's display color (hex string). |
-| `context["set_geometry"](device_id, geometry)` | Replaces the device's geometry block (a dict with `type`, `dimensions`, etc.) used by the visualizer. |
-| `context["update_device_context"](device_id, patch)` | Shallow-merges `patch` into the device's `device_context` JSON field. |
+**Two link types:**
+- **Slot link** (formal): the instance template declares typed slots (e.g. `Forklift` requires a slot named `gps` with `device_type_id` pointing at `gps_sensor` in the device catalog). Slot fillers are declared during instance creation or via the Manage Devices modal.
+- **Extra link** (free): for ad-hoc cases not covered by the template. No `slot_name`, just an association.
 
-#### Instance-state helpers
+When an algorithm runs, the runtime resolves the source device's owner instance (if any) and injects extra fields into `context` so algorithms do not need to look up the owner manually.
 
-| Function | Purpose |
-| --- | --- |
-| `context["get_instance"](id_or_uuid)` | Returns the full Instance dict (`consolidated_state`, `manual_position`, `physical_dimensions`, `parent_id`, `baseline_state`, `template`, ...). Accepts either the user-defined `instance_id` or the internal UUID. Returns `None` if not found. |
-| `context["get_instances_by_template"](template_name)` | Returns a list of Instances whose `instance_type` matches the given template name. |
-| `context["update_instance_position"](id, x, y, z=0.0)` | Sets the Instance's `manual_position`. Visible in the Space View on the next polling tick. |
-| `context["update_instance_state"](id, patch)` | Shallow-merges `patch` into `consolidated_state`. To delete a key, set it to `None`. Example: if the current state is `{"status": "idle", "battery": 80}` and the patch is `{"status": "moving", "battery": None}`, the resulting state is `{"status": "moving"}`. |
-| `context["update_instance_parent"](id, parent_id)` | Re-parents an Instance (changes the hierarchy). Pass `None` to detach. Useful for "this entity is now being carried by another" scenarios. |
-| `context["reset_instance_to_baseline"](id)` | Restores `manual_position`, `consolidated_state`, and `parent_id` to the saved baseline for a single instance. |
+### 13.2 Built-in Context Fields (All Algorithms)
 
-#### HTTP integration
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `context["device_id"]` | str | Identifier of the source device. |
+| `context["device_name"]` | str | Human-readable name of the device. |
+| `context["device_context"]` | dict | The `device_context` JSON field of the device (per-device configuration). |
+| `context["instance"]` | dict or None | Full owner-instance row (`id`, `instance_id`, `instance_type`, `consolidated_state`, `slot_name`, …). `None` if the device has no owner. |
+| `context["instance_id"]` | str or None | User-defined identifier of the owner instance. |
+| `context["instance_uuid"]` | str or None | UUID of the owner instance. |
+| `context["instance_state"]` | dict | `consolidated_state` of the owner (empty dict if no owner). |
+| `context["devices"]` | dict | `{slot_name: device_dict}` — auxiliary devices in the same owner instance, keyed by slot. |
 
-| Function | Purpose |
-| --- | --- |
-| `context["webhook"](url, payload, headers=None, timeout=5)` | POSTs `payload` as JSON to `url`. Returns a dict `{"ok": bool, "status": int, ...}`. Useful for forwarding events to external systems (Slack, Grafana annotations, custom analytics). |
-
-### 13.2 Built-in Context Fields (Generation Algorithms)
-
-When a generation algorithm runs, these fields are populated:
+**Generation-only fields:**
 
 | Field | Purpose |
 | --- | --- |
-| `context["device_id"]` | The identifier of the device this algorithm is firing for. |
-| `context["device_name"]` | Human-readable name of the device. |
 | `context["last_execution"]` | Timestamp of the previous execution (or `None` on the first run). |
 | `context["execution_count"]` | Integer counter, increments on every execution. |
-| `context["message_definition"]` | Dict with `name` and `schemas` of the Message Definition this algorithm produces (when configured). |
-| `context["device_context"]` | The `device_context` JSON field of the device. Lets you store per-device configuration. |
-| `context["params"]` | The `params` dict passed by the user when triggering a manual generation algorithm via **Run now**. Empty for periodic generators. |
+| `context["message_definition"]` | Dict with `name` and `schemas` of the Message Definition this algorithm produces. |
+| `context["params"]` | Dict passed by the user when triggering a manual generation algorithm via **Run now**. Empty for periodic generators. |
 
-### 13.3 Built-in Context Fields (Processing Algorithms)
-
-Processing algorithms receive different built-ins because they are reactive to incoming messages:
+**Processing-only fields:**
 
 | Field | Purpose |
 | --- | --- |
-| `context["timestamp"]` | The timestamp of the incoming message in ISO-8601 format. |
-| `context["alert"](severity, message)` | Emits an alert. `severity` is one of `"info"`, `"warning"`, `"critical"`. **Only available in processing algorithms** — generation algorithms cannot raise alerts directly. Append-only: there is no "resolve" API. |
-| Standard device and instance helpers (same as section 13.1). | |
+| `context["timestamp"]` | Timestamp of the incoming message in ISO-8601 format. |
 
-### 13.4 Patterns and Tips
+If the device has no owner instance, `context["instance"]` is `None` and the algorithm should fall back to payload-based logic. This is the standard pattern for observer devices (e.g. a gate RFID reader that observes many entities without "belonging" to any of them).
 
-- **Always read state via `get_instance`** rather than caching it across ticks: another algorithm may have mutated it.
-- **Use `update_instance_state` instead of replacing `consolidated_state` wholesale**: shallow merge avoids clobbering fields written by other algorithms.
-- **Normalize `manual_position`**: it may be `None`, a string (legacy JSON), or a dict. Defensive code: `pos = inst.get("manual_position") or {}`.
-- **To raise alerts from generation logic**, route through a processing algorithm: emit a domain-specific event from the generator, then a processing algorithm subscribed to that message calls `context["alert"]`.
-- **`webhook` is the escape hatch for external integrations**: anything you cannot do with the built-in helpers can be done via an HTTP webhook to a service you control.
-- **Standard library only**: algorithms run in a sandboxed Python environment.
+### 13.3 Implicit Helpers (Act on the Owner Instance)
+
+These helpers operate on `context["instance"]` automatically — no instance identifier required. They become **no-ops** if the device has no owner.
+
+| Helper | Use |
+| --- | --- |
+| `context["update_state"](patch)` | Shallow-merge `patch` into the owner instance's `consolidated_state`. To delete a key, pass `None` as its value. |
+| `context["set_position"](x, y, z=0.0)` | Set `manual_position` of the owner. |
+| `context["update_parent"](parent_identifier)` | Re-parent the owner (pass `None` to detach). |
+| `context["reset_state"]()` | Restore the owner from its baseline (`manual_position`, `consolidated_state`, `parent_id`). |
+
+Use these when the algorithm naturally manipulates only its own owner — the common case for telemetry algorithms on a single-owner device.
+
+### 13.4 Explicit Helpers (Act on Any Instance by Identifier)
+
+For cross-instance operations (e.g. a forklift updating the container it is carrying).
+
+| Helper | Use |
+| --- | --- |
+| `context["get_instance"](identifier)` | Returns the full Instance dict (`consolidated_state`, `manual_position`, `physical_dimensions`, `parent_id`, `baseline_state`, `template`, …). Returns `None` if not found. |
+| `context["get_instances_by_template"](template_name)` | Returns a list of Instances whose `instance_type` matches the given template name. |
+| `context["update_instance_state"](identifier, patch)` | Shallow-merge `patch` into `consolidated_state`. To delete a key, pass `None`. Example: with current state `{"status": "idle", "battery": 80}` and patch `{"status": "moving", "battery": None}`, the result is `{"status": "moving"}`. |
+| `context["update_instance_position"](identifier, x, y, z=0.0)` | Sets the Instance's `manual_position`. Visible in the Space View on the next polling tick. |
+| `context["update_instance_parent"](identifier, parent_identifier)` | Re-parents an Instance. Pass `None` to detach. |
+| `context["reset_instance_to_baseline"](identifier)` | Restores a single instance from its baseline. |
+
+**`identifier` dual form.** Every helper that takes `identifier` accepts either the user-defined string id (e.g. `"container-a-1"`) or the raw UUID. Mixing forms within an algorithm is fine — the helper resolves which one it got.
+
+### 13.5 Device-Level Helpers
+
+For algorithms that manipulate the **source device itself** (geometry, color, persisted context) rather than its owner instance.
+
+| Helper | Use |
+| --- | --- |
+| `context["get_device"](device_id)` | Returns the full Device dict (`device_mode`, `device_type_id`, `device_type_name`, `device_context`, `parent_id`, `geometry`, …). Returns `None` if not found. |
+| `context["update_position"](device_id, x, y, z=0.0)` | Move the device marker on the floorplan (meters). |
+| `context["update_floorplan_position"](device_id, x, y)` | Normalized position on its parent floorplan (0.0–1.0). |
+| `context["set_color"](device_id, color)` | Recolor the device marker (hex string, e.g. `"#ff4d4f"`). |
+| `context["set_geometry"](device_id, geometry)` | Atomic update of multiple geometry fields (`{x, y, z, color}` dict). |
+| `context["update_device_context"](device_id, patch)` | Shallow-merge `patch` into the device's `device_context` JSON field. |
+
+**`device_mode` vs `device_type_id`.** Devices have two distinct type fields, do not confuse them:
+- `device_mode` — `"physical"` or `"synthetic"`. The runtime origin (real-world device vs simulated).
+- `device_type_id` — UUID into `dt_device_types` (the catalog). The semantic category (`rfid_scanner`, `forklift_telemetry`, …). The catalog name is exposed as `device_type_name` for display.
+
+### 13.6 Side-Effects: Alerts and Webhooks
+
+| Helper | Use |
+| --- | --- |
+| `context["alert"](severity, message)` | Push a row to `dt_alerts`. `severity` is one of `"info"`, `"warning"`, `"critical"`. Alerts surface in the global Alerts tab and the header badge. Available in **both** generation and processing algorithms. Append-only — there is no "resolve" API. |
+| `context["webhook"](url, payload, headers=None, timeout=5)` | One-shot HTTP POST to an external endpoint. Returns the parsed JSON response (or `{}` on success without body). Use for ERP integrations, Slack/Discord notifications, dashboards. |
+
+```python
+def process_data(data, context):
+    if data.get("temperature", 0) > 90:
+        context["alert"]("critical", f"Overheating: {data['temperature']}°C")
+        context["webhook"]("http://erp.example/api/incidents", {
+            "asset": context["instance_id"],
+            "type": "overheat",
+            "value": data["temperature"],
+        })
+    return data
+```
+
+### 13.7 State Ownership
+
+**As of v2.9.6, the runtime no longer auto-merges outgoing telemetry into the owner instance's `consolidated_state`.** State is owned exclusively by the algorithm — if you want a telemetry field to land in state, write it yourself using `update_state` (implicit) or `update_instance_state` (explicit).
+
+Telemetry is still persisted to the per-DT-Type message history for the Live Feed and the Dashboard, regardless of whether you wrote it to state.
+
+This change avoids a subtle race: prior versions silently overwrote helper-written state with whatever the algorithm returned from `generate_data`, which made it impossible to keep a state field divorced from the telemetry payload (e.g. a status field whose value should not echo the latest telemetry verbatim).
+
+**Return value contract:**
+- Generation algorithms return a `dict` (the telemetry payload to publish), `None` to skip the tick, or a `list[dict]` to emit several messages.
+- Processing algorithms return `dict` — the (possibly transformed) `data` — so a pipeline of processing algorithms can chain.
+- Returning a non-dict raises an error in the message processor.
+
+### 13.8 Example: Forklift Telemetry (with Owner Instance)
+
+A `Forklift` instance owns a GPS device. The GPS device runs a generation algorithm that publishes position and updates the forklift's state implicitly.
+
+```python
+def generate_data(context):
+    me = context["instance"]                         # the forklift
+    if not me:
+        return None                                  # device has no owner — skip
+    state = me["consolidated_state"]
+
+    next_x, next_y = compute_movement(state)         # your domain logic
+
+    # Update implicitly — no instance ID needed
+    context["set_position"](next_x, next_y)
+    context["update_state"]({"speed": state.get("speed", 0) + 1})
+
+    return {
+        "forklift_id": me["instance_id"],
+        "position": {"x": next_x, "y": next_y},
+        "timestamp": context["timestamp"] if "timestamp" in context else None,
+    }
+```
+
+If the algorithm needs to update a **different** instance (e.g. the container being carried), use the explicit helper:
+
+```python
+context["update_instance_position"](carried_container_id, next_x, next_y, next_z + 1.5)
+```
+
+### 13.9 Example: Observer Device (No Owner)
+
+A gate RFID reader does not "belong" to a single container — it observes many. Such devices have no owner instance, so `context["instance"]` is `None` and the algorithm uses the payload to identify the observed entity.
+
+```python
+def process_data(data, context):
+    seen_tag = data["payload"]["rfid_tag"]
+    target = context["get_instance"](seen_tag)
+    if target:
+        context["update_instance_state"](seen_tag, {
+            "last_seen": context["timestamp"],
+            "last_gate": context["device_id"],
+        })
+    return data
+```
+
+### 13.10 Patterns and Tips
+
+- **Prefer implicit helpers** (`update_state`, `set_position`) when working on the owner instance — less boilerplate, fewer chances to mistype an identifier.
+- **Use explicit helpers** when the algorithm naturally touches multiple instances (carrier-and-cargo, sender-and-receiver, scanner-and-target).
+- **Always read state via `get_instance`** inside the same tick rather than caching across ticks: another algorithm may have mutated it.
+- **`update_state` and `update_instance_state` are shallow merges** — they avoid clobbering fields written by other algorithms. Replace `consolidated_state` wholesale only when you really want to reset it.
+- **Normalize `manual_position`** when reading via `get_instance`: it may be `None`, a string (legacy JSON), or a dict. Defensive code: `pos = inst.get("manual_position") or {}`.
+- **Helpers fail soft.** Each helper catches HTTP errors and returns `False` / `None` instead of raising, so a single network blip will not crash an algorithm. The error is `print()`-logged inside the DT container — grep for `[helper]` in the logs.
+- **`webhook` is the escape hatch** for external integrations: anything you cannot do with the built-in helpers can be done via an HTTP webhook to a service you control.
+- **Standard library only.** Algorithms run in a sandboxed Python environment — `datetime`, `json`, `math`, `random`, `statistics`, `urllib.request`, `uuid`, `re`, `collections` are available. Third-party packages (`numpy`, `pandas`, `requests`) are not.
 
 ---
 
